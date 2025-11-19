@@ -14,14 +14,13 @@ from transformers import (
     DataCollatorForLanguageModeling,
 )
 from peft import LoraConfig, get_peft_model, TaskType
-from huggingface_hub import login
-login()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 CUDA_VISIBLE_DEVICES=0
 MODEL_NAME = "Qwen/Qwen2.5-3B"
+CUDA_LAUNCH_BLOCKING=1
 
 # LoRA experiments to run.  Each key corresponds to a subdirectory under
 # ``--output_dir``.  The value is the list of module names to adapt.
@@ -172,7 +171,8 @@ def tokenize_function(examples: Dict[str, List[str]], tokenizer: AutoTokenizer, 
     inputs = [p + " " + a for p, a in zip(examples["prompt"], examples["answer"])]
     model_inputs = tokenizer(inputs, max_length=max_length, truncation=True, padding="max_length")
     # The labels are the same as the input_ids; mask the prompt part to ignore its loss.
-    labels = model_inputs["input_ids"].copy()
+    input_ids = model_inputs["input_ids"]
+    labels = [seq[:] for seq in input_ids]  # <-- deep copy each inner list
     # Identify the end of the prompt and set tokens before it to -100 so that loss only applies to the answer.
     for i, (prompt, answer) in enumerate(zip(examples["prompt"], examples["answer"])):
         prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
@@ -226,7 +226,7 @@ def run_experiment(name: str, target_modules: List[str], datasets_dict: Dict[str
     experiment_output = f"{args.output_dir}/{name}"
     training_args = TrainingArguments(
         output_dir=experiment_output,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=200,
         save_total_limit=3,
         load_best_model_at_end=False,
