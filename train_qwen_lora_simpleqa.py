@@ -13,13 +13,13 @@ from transformers import (
     TrainingArguments,
     DataCollatorForLanguageModeling,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 CUDA_VISIBLE_DEVICES=0
-MODEL_NAME = "Qwen/Qwen2.5-3B"
+MODEL_NAME = "Qwen/Qwen3-1.7B"
 CUDA_LAUNCH_BLOCKING=1
 
 # LoRA experiments to run.  Each key corresponds to a subdirectory under
@@ -126,6 +126,42 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TRAIN_ARGS["fp16"],
         help="Use 16‑bit precision during training.",
     )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+        help="Directory to write intermediate checkpoints (default: same as --output_dir).",
+    )
+    parser.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=DEFAULT_TRAIN_ARGS["save_steps"],
+        help="Save a checkpoint every N update steps (default: 200).",
+    )
+    parser.add_argument(
+        "--save_total_limit",
+        type=int,
+        default=3,
+        help="Maximum number of checkpoints to keep (default: 3).",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Path to a checkpoint folder to resume training from (default: None).",
+    )
+    parser.add_argument(
+        "--pretrained_lora_path",
+        type=str,
+        default=None,
+        help="Path to a pre-trained LoRA adapter to continue training (continual fine-tuning).",
+    )
+    parser.add_argument(
+        "--train_test_split",
+        type=float,
+        default=0.8,
+        help="Fraction of data to use for training (default: 0.8, test gets remaining 0.2).",
+    )
     return parser.parse_args()
 
 
@@ -151,17 +187,22 @@ def build_prompt(example: Dict[str, Any]) -> Dict[str, str]:
     return {"prompt": prompt, "answer": answer}
 
 
-def prepare_dataset() -> Dict[str, datasets.Dataset]:
-    """Load and preprocess the SimpleQA Verified dataset."""
+def prepare_dataset(train_split_ratio: float = 0.8) -> Dict[str, datasets.Dataset]:
+    """Load and preprocess the SimpleQA Verified dataset with train/test split."""
     # Load the entire dataset (simpleqa_verified split 'eval').
     raw = datasets.load_dataset("google/simpleqa-verified", split="eval")
     # Keep only examples grounded by at least one Wikipedia URL.
     wiki_subset = filter_wikipedia_examples(raw)
     # Map into prompt/answer pairs.
     processed = wiki_subset.map(build_prompt, remove_columns=wiki_subset.column_names)
+    
+    # Split into train/test for proper evaluation on held-out data
+    split_dict = processed.train_test_split(test_size=1.0 - train_split_ratio, seed=42)
+    print(f"Dataset split: {len(split_dict['train'])} train, {len(split_dict['test'])} test")
+    
     return {
-        "train": processed,
-        "eval": processed  # For demonstration we reuse the subset for evaluation.
+        "train": split_dict["train"],
+        "eval": split_dict["test"]  # Use test split for evaluation
     }
 
 
@@ -194,15 +235,21 @@ def run_experiment(name: str, target_modules: List[str], datasets_dict: Dict[str
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
     model.resize_token_embeddings(len(tokenizer))
 
-    # Build LoRA configuration.
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=8,  # Rank of the LoRA approximation.  Increase for stronger adaptation.
-        lora_alpha=16,
-        lora_dropout=0.05,
-        target_modules=target_modules,
-    )
-    model = get_peft_model(model, lora_config)
+    # Load pre-trained LoRA adapter for continual fine-tuning or create new one.
+    if args.pretrained_lora_path:
+        print(f"Loading pre-trained LoRA adapter from {args.pretrained_lora_path} for continual fine-tuning...")
+        model = PeftModel.from_pretrained(model, args.pretrained_lora_path, is_trainable=True)
+        print("Continuing training on previously trained adapter.")
+    else:
+        # Build LoRA configuration from scratch.
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=8,  # Rank of the LoRA approximation.  Increase for stronger adaptation.
+            lora_alpha=16,
+            lora_dropout=0.05,
+            target_modules=target_modules,
+        )
+        model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
     # Tokenize the dataset.
@@ -224,11 +271,14 @@ def run_experiment(name: str, target_modules: List[str], datasets_dict: Dict[str
 
     # Define training arguments.  The output directory includes the experiment name.
     experiment_output = f"{args.output_dir}/{name}"
+    checkpoint_dir = f"{args.checkpoint_dir}/{name}" if args.checkpoint_dir else experiment_output
     training_args = TrainingArguments(
-        output_dir=experiment_output,
+        output_dir=checkpoint_dir,
         eval_strategy="steps",
         eval_steps=200,
-        save_total_limit=3,
+        save_steps=args.save_every_steps,
+        save_total_limit=args.save_total_limit,
+        save_strategy="steps",
         load_best_model_at_end=False,
         ddp_find_unused_parameters=False,
         remove_unused_columns=True,
@@ -250,7 +300,11 @@ def run_experiment(name: str, target_modules: List[str], datasets_dict: Dict[str
         data_collator=data_collator,
     )
 
-    trainer.train()
+    # Start training (resume if requested)
+    resume_arg = args.resume_from_checkpoint if args.resume_from_checkpoint else None
+    if resume_arg:
+        print(f"Resuming from checkpoint: {resume_arg}")
+    trainer.train(resume_from_checkpoint=resume_arg)
     # Save only the LoRA adapter to disk.
     model.save_pretrained(experiment_output)
 
@@ -258,8 +312,9 @@ def run_experiment(name: str, target_modules: List[str], datasets_dict: Dict[str
 def main() -> None:
     args = parse_args()
     # Prepare the dataset once and reuse across experiments.
-    datasets_dict = prepare_dataset()
-    print(f"Loaded {len(datasets_dict['train'])} examples with Wikipedia grounding.")
+    datasets_dict = prepare_dataset(train_split_ratio=args.train_test_split)
+    print(f"Loaded {len(datasets_dict['train'])} training examples with Wikipedia grounding.")
+    print(f"Held out {len(datasets_dict['eval'])} test examples for evaluation.")
     for exp_name in args.experiments:
         target_modules = EXPERIMENTS[exp_name]
         run_experiment(exp_name, target_modules, datasets_dict, args)
